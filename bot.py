@@ -1,4 +1,5 @@
 import os
+import asyncio
 import discord
 from google import genai
 from google.genai import types
@@ -140,11 +141,11 @@ async def on_message(message):
     if not user_text:
         return
 
-    # Save Discord display name to DB silently (for our records only, not told to Nisama)
+    # Always save/update basic profile from Discord display name
     save_user_profile(user_id, username)
 
-    # Extract facts from this message (non-blocking, best effort)
-    await extract_and_save_facts(user_id, username, user_text)
+    # Extract facts in background — doesn't block Nisama's reply
+    asyncio.create_task(extract_and_save_facts(user_id, username, user_text))
 
     # Get this user's personal history
     history = get_history(user_id)
