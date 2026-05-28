@@ -166,6 +166,7 @@ async def on_message(message):
     if global_context:
         full_system += f"\n\n{global_context}"
 
+    error_occurred = False
     async with message.channel.typing():
         try:
             contents = build_gemini_contents(history)
@@ -190,8 +191,10 @@ async def on_message(message):
         except Exception as e:
             print(f"Gemini error: {e}")
             reply = "Nisama currently AFK, please try again later."
+            error_occurred = True
 
-    save_message(user_id, "assistant", reply)
+    if not error_occurred:
+        save_message(user_id, "assistant", reply)
 
     if len(reply) > 2000:
         reply = reply[:1997] + "..."
