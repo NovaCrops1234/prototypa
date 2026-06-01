@@ -1,6 +1,7 @@
 import os
 import asyncio
 import discord
+import psycopg2
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -8,7 +9,8 @@ from persona import SYSTEM_PROMPT
 from memory import (
     init_db, get_history, save_message, clear_history,
     save_global_fact, get_global_memory,
-    save_user_profile, get_user_profile
+    save_user_profile, get_user_profile,
+    get_active_users, has_broadcast_sent, mark_broadcast_sent
 )
 
 load_dotenv()
@@ -53,14 +55,17 @@ Output: ["Recently visited Hant City ruins", "Doing scouting work for J-san"]
 
 
 # Main
-async def extract_and_save_facts(user_id: str, username: str, message: str):
+async def extract_and_save_facts(user_id: str, discord_name: str, message: str):
     """Extract notable facts from a message and save to global memory."""
+    profile = get_user_profile(user_id)
+    known_as = profile["known_as"] if profile and profile["known_as"] else None
+
     try:
         response = client_ai.models.generate_content(
             model="gemini-3.1-flash-lite",
             contents=[types.Content(
                 role="user",
-                parts=[types.Part(text=f"Username: {username}\nMessage: {message}")]
+                parts=[types.Part(text=f"Known as (if introduced): {known_as or 'unknown'}\nMessage: {message}")]
             )],
             config=types.GenerateContentConfig(
                 system_instruction=EXTRACT_PROMPT,
@@ -70,7 +75,6 @@ async def extract_and_save_facts(user_id: str, username: str, message: str):
         )
         import json
         raw = response.text.strip()
-        # Strip markdown code fences if present
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -78,12 +82,11 @@ async def extract_and_save_facts(user_id: str, username: str, message: str):
         facts = json.loads(raw.strip())
         for fact in facts:
             if fact:
-                save_global_fact(user_id, username, fact)
+                save_global_fact(user_id, known_as or "unknown one", fact)
 
-        # If someone introduces a custom name, save it to their profile
         for fact in facts:
             if "introduced" in fact.lower() or "known as" in fact.lower() or "calls himself" in fact.lower() or "calls herself" in fact.lower():
-                save_user_profile(user_id, username, known_as=fact.split("as")[-1].strip().strip('"').strip("'"))
+                save_user_profile(user_id, discord_name, known_as=fact.split("as")[-1].strip().strip('"').strip("'"))
 
     except Exception as e:
         print(f"Fact extraction error (non-critical): {e}")
@@ -103,22 +106,71 @@ def build_gemini_contents(history: list) -> list:
 
 
 def build_global_context(current_user_id: str) -> str:
-    """Build a summary of what Nisama knows about everyone."""
     all_facts = get_global_memory(limit=30)
-    if not all_facts:
-        return ""
-    
-    lines = ["Nisama's shared memory — things Nisama knows about people:"]
-    for f in all_facts:
-        name = f["name"] or "Unknown one"
-        lines.append(f"- {name}: {f['fact']}")
-    
-    return "\n".join(lines)
+    active = get_active_users(minutes=10)
 
+    lines = []
+
+    if active:
+        lines.append("Users Nisama is currently or recently talking to (last 10 minutes):")
+        for a in active:
+            lines.append(f"- {a['name']}: {a['fact'] or 'no details yet'}")
+        lines.append("")
+
+    if all_facts:
+        lines.append("Nisama's shared memory — things Nisama knows about people:")
+        for f in all_facts:
+            name = f["name"] or "unknown one"
+            lines.append(f"- {name}: {f['fact']}")
+
+    return "\n".join(lines) if lines else ""
+
+
+CHANGELOG_VERSION = "v1.1.3"
+CHANGELOG = """
+Nisama v1.1.3 Changelog
+
+— Added one-time changelog broadcast support for automatically notifying previously interacted users about new updates
+For this one is currently on a Beta testing state that hopefully would be fully pledged into an actual command system on the next major update
+
+— Fixed bug where Discord display names could leak into Nisama's memory and identity systems
+— Fixed bug where users introducing themselves under a different name could still be associated with their Discord account name
+— Fixed bug where anonymous users could be indirectly identified through shared memory records
+— Fixed bug where Nisama could incorrectly claim she had not recently spoken with someone despite active ongoing conversations
+— Fixed bug where action-style narration and formatting could still aggresivelly occasionally appear instead of normal spoken dialogue
+— Improved shared memory awareness so Nisama can better recognize recently active conversations across multiple users
+— Improved identity handling to further separate Discord account information from information explicitly provided by users
+— Improved global memory behavior for anonymous users and users with self-introduced names
+— Adjusted memory and profile systems in preparation for the larger identity and memory overhaul
+"""
+
+async def broadcast_changelog():
+    con = psycopg2.connect(os.getenv("DATABASE_URL"))
+    cur = con.cursor()
+    cur.execute("SELECT DISTINCT user_id FROM history")
+    user_ids = [r[0] for r in cur.fetchall()]
+    cur.close()
+    con.close()
+
+    for uid in user_ids:
+        try:
+            user = await bot.fetch_user(int(uid))
+            await user.send(CHANGELOG)
+            print(f"Sent changelog to {uid}")
+        except Exception as e:
+            print(f"Could not send to {uid}: {e}")
 
 @bot.event
 async def on_ready():
     print(f"Bot is online as {bot.user} (ID: {bot.user.id})")
+    print("Listening for DMs only.")
+
+    if not has_broadcast_sent(CHANGELOG_VERSION):
+        await broadcast_changelog()
+        mark_broadcast_sent(CHANGELOG_VERSION)
+        print(f"Changelog {CHANGELOG_VERSION} broadcast done.")
+    else:
+        print(f"Changelog {CHANGELOG_VERSION} already sent, skipping.")
 
 
 @bot.event
@@ -130,7 +182,7 @@ async def on_message(message):
         return
 
     user_id = str(message.author.id)
-    username = message.author.display_name
+    discord_display_name = message.author.display_name
     user_text = message.content.strip()
 
     if user_text.lower() in ["clear memory"]:
@@ -141,11 +193,11 @@ async def on_message(message):
     if not user_text:
         return
 
-    # Always save/update basic profile from Discord display name
-    save_user_profile(user_id, username)
+    # Save Discord name silently to DB only — Nisama never sees this
+    save_user_profile(user_id, discord_display_name)
 
-    # Extract facts in background — doesn't block Nisama's reply
-    asyncio.create_task(extract_and_save_facts(user_id, username, user_text))
+    # Pass user_id only, no display name leaked to extraction
+    asyncio.create_task(extract_and_save_facts(user_id, discord_display_name, user_text))
 
     # Get this user's personal history
     history = get_history(user_id)

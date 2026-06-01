@@ -129,3 +129,51 @@ def get_user_profile(user_id: str) -> dict:
     if row:
         return {"display_name": row[0], "known_as": row[1]}
     return None
+
+def get_active_users(minutes: int = 10) -> list:
+    """Get users who have chatted in the last X minutes."""
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute(
+        """SELECT DISTINCT up.known_as, gm.fact
+           FROM user_profiles up
+           LEFT JOIN global_memory gm ON gm.about_user_id = up.user_id
+           WHERE up.known_as IS NOT NULL
+           AND up.user_id IN (
+               SELECT DISTINCT user_id FROM history
+               WHERE ts >= NOW() - INTERVAL '%s minutes'
+           )
+           ORDER BY up.known_as""",
+        (minutes,)
+    )
+    rows = cur.fetchall()
+    cur.close()
+    con.close()
+    return [{"name": r[0], "fact": r[1]} for r in rows]
+
+def has_broadcast_sent(version: str) -> bool:
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS broadcast_log (
+            version TEXT PRIMARY KEY,
+            sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    con.commit()
+    cur.execute("SELECT version FROM broadcast_log WHERE version = %s", (version,))
+    result = cur.fetchone()
+    cur.close()
+    con.close()
+    return result is not None
+
+def mark_broadcast_sent(version: str):
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO broadcast_log (version) VALUES (%s) ON CONFLICT DO NOTHING",
+        (version,)
+    )
+    con.commit()
+    cur.close()
+    con.close()
