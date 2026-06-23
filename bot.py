@@ -6,6 +6,7 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 from persona import SYSTEM_PROMPT
+from changelog import CHANGELOG_VERSION, CHANGELOG
 from memory import (
     init_db, get_history, save_message, clear_history,
     save_global_fact, get_global_memory,
@@ -56,7 +57,6 @@ Output: ["Recently visited Hant City ruins", "Doing scouting work for J-san"]
 
 # Main
 async def extract_and_save_facts(user_id: str, discord_name: str, message: str):
-    """Extract notable facts from a message and save to global memory."""
     profile = get_user_profile(user_id)
     known_as = profile["known_as"] if profile and profile["known_as"] else None
 
@@ -80,13 +80,23 @@ async def extract_and_save_facts(user_id: str, discord_name: str, message: str):
             if raw.startswith("json"):
                 raw = raw[4:]
         facts = json.loads(raw.strip())
-        for fact in facts:
-            if fact:
-                save_global_fact(user_id, known_as or "unknown one", fact)
 
         for fact in facts:
-            if "introduced" in fact.lower() or "known as" in fact.lower() or "calls himself" in fact.lower() or "calls herself" in fact.lower():
-                save_user_profile(user_id, discord_name, known_as=fact.split("as")[-1].strip().strip('"').strip("'"))
+            is_introduction = (
+                "introduced" in fact.lower() or
+                "known as" in fact.lower() or
+                "calls himself" in fact.lower() or
+                "calls herself" in fact.lower()
+            )
+
+            if is_introduction:
+                if not known_as:
+                    extracted_name = fact.split("as")[-1].strip().strip('"').strip("'")
+                    save_user_profile(user_id, discord_name, known_as=extracted_name)
+                continue
+
+            if fact:
+                save_global_fact(user_id, known_as or "unknown one", fact)
 
     except Exception as e:
         print(f"Fact extraction error (non-critical): {e}")
@@ -125,24 +135,6 @@ def build_global_context(current_user_id: str) -> str:
 
     return "\n".join(lines) if lines else ""
 
-
-CHANGELOG_VERSION = "v1.1.3"
-CHANGELOG = """
-Nisama v1.1.3 Changelog
-
-— Added one-time changelog broadcast support for automatically notifying previously interacted users about new updates
-For this one is currently on a Beta testing state that hopefully would be fully pledged into an actual command system on the next major update
-
-— Fixed bug where Discord display names could leak into Nisama's memory and identity systems
-— Fixed bug where users introducing themselves under a different name could still be associated with their Discord account name
-— Fixed bug where anonymous users could be indirectly identified through shared memory records
-— Fixed bug where Nisama could incorrectly claim she had not recently spoken with someone despite active ongoing conversations
-— Fixed bug where action-style narration and formatting could still aggresivelly occasionally appear instead of normal spoken dialogue
-— Improved shared memory awareness so Nisama can better recognize recently active conversations across multiple users
-— Improved identity handling to further separate Discord account information from information explicitly provided by users
-— Improved global memory behavior for anonymous users and users with self-introduced names
-— Adjusted memory and profile systems in preparation for the larger identity and memory overhaul
-"""
 
 async def broadcast_changelog():
     con = psycopg2.connect(os.getenv("DATABASE_URL"))
