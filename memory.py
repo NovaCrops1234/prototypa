@@ -131,7 +131,6 @@ def get_user_profile(user_id: str) -> dict:
     return None
 
 def get_active_users(minutes: int = 10) -> list:
-    """Get users who have chatted in the last X minutes."""
     con = get_conn()
     cur = con.cursor()
     cur.execute(
@@ -141,7 +140,7 @@ def get_active_users(minutes: int = 10) -> list:
            WHERE up.known_as IS NOT NULL
            AND up.user_id IN (
                SELECT DISTINCT user_id FROM history
-               WHERE ts >= NOW() - INTERVAL '%s minutes'
+               WHERE ts >= NOW() - (INTERVAL '1 minute' * %s)
            )
            ORDER BY up.known_as""",
         (minutes,)
@@ -173,6 +172,66 @@ def mark_broadcast_sent(version: str):
     cur.execute(
         "INSERT INTO broadcast_log (version) VALUES (%s) ON CONFLICT DO NOTHING",
         (version,)
+    )
+    con.commit()
+    cur.close()
+    con.close()
+
+def has_seen_update(user_id: str, version: str) -> bool:
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_update_log (
+            user_id TEXT NOT NULL,
+            version TEXT NOT NULL,
+            PRIMARY KEY (user_id, version)
+        )
+    """)
+    con.commit()
+    cur.execute(
+        "SELECT 1 FROM user_update_log WHERE user_id = %s AND version = %s",
+        (user_id, version)
+    )
+    result = cur.fetchone()
+    cur.close()
+    con.close()
+    return result is not None
+
+def mark_update_seen(user_id: str, version: str):
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO user_update_log (user_id, version) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+        (user_id, version)
+    )
+    con.commit()
+    cur.close()
+    con.close()
+
+def get_all_user_ids() -> list:
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute("SELECT DISTINCT user_id FROM history")
+    rows = cur.fetchall()
+    cur.close()
+    con.close()
+    return [r[0] for r in rows]
+
+def log_slash_command(user_id: str, command: str):
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS slash_command_log (
+            id SERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            command TEXT NOT NULL,
+            ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    con.commit()
+    cur.execute(
+        "INSERT INTO slash_command_log (user_id, command) VALUES (%s, %s)",
+        (user_id, command)
     )
     con.commit()
     cur.close()
