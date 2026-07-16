@@ -3,6 +3,7 @@ import json
 import random
 import asyncio
 import discord
+from discord import app_commands
 from discord.ext import commands
 from google import genai
 from google.genai import types
@@ -140,15 +141,145 @@ async def extract_and_save_facts(user_id: str, discord_name: str, message: str):
 
 
 def get_update_notice() -> str:
-    """Returns a short in-character update notice from Nisama."""
     prev = {
-        "v1.2.0": "v1.1.4"
+        "v1.2.0": "v1.1.4",
+        "v1.2.1": "v1.2.0"
     }
     prev_version = prev.get(CHANGELOG_VERSION, "the previous version")
     return (
         f"Greetings there! Nisama here would like to mention that Nisama system got updated from {prev_version} to "
         f"{CHANGELOG_VERSION} here! One can use /changelog to see what changed ehehe."
     )
+
+
+class TicTacToeView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.board = [None] * 9
+        self.game_over = False
+        self._add_buttons()
+
+    def _add_buttons(self):
+        for i in range(9):
+            self.add_item(TicTacToeButton(i))
+
+    def render_board(self) -> str:
+        symbols = {None: "⬜", "X": "❌", "O": "⭕"}
+        rows = []
+        for r in range(3):
+            rows.append(" ".join(symbols[self.board[r * 3 + c]] for c in range(3)))
+        return "\n".join(rows)
+
+    def check_winner(self) -> str | None:
+        wins = [
+            (0,1,2),(3,4,5),(6,7,8),
+            (0,3,6),(1,4,7),(2,5,8),
+            (0,4,8),(2,4,6)
+        ]
+        for a, b, c in wins:
+            if self.board[a] and self.board[a] == self.board[b] == self.board[c]:
+                return self.board[a]
+        if all(self.board):
+            return "draw"
+        return None
+
+    def nisama_move(self):
+        # Try to win
+        for i in range(9):
+            if self.board[i] is None:
+                self.board[i] = "O"
+                if self.check_winner() == "O":
+                    return
+                self.board[i] = None
+
+        # Block player win
+        for i in range(9):
+            if self.board[i] is None:
+                self.board[i] = "X"
+                if self.check_winner() == "X":
+                    self.board[i] = "O"
+                    return
+                self.board[i] = None
+
+        # Take center
+        if self.board[4] is None:
+            self.board[4] = "O"
+            return
+
+        # Take any corner
+        for i in [0, 2, 6, 8]:
+            if self.board[i] is None:
+                self.board[i] = "O"
+                return
+
+        # Take any space
+        for i in range(9):
+            if self.board[i] is None:
+                self.board[i] = "O"
+                return
+
+
+class TicTacToeButton(discord.ui.Button):
+    def __init__(self, index: int):
+        super().__init__(style=discord.ButtonStyle.secondary, label="　", row=index // 3)
+        self.index = index
+
+    async def callback(self, interaction: discord.Interaction):
+        view: TicTacToeView = self.view
+
+        if view.game_over:
+            await interaction.response.defer()
+            return
+
+        if view.board[self.index] is not None:
+            await interaction.response.defer()
+            return
+
+        # Player move
+        view.board[self.index] = "X"
+        self.style = discord.ButtonStyle.danger
+        self.label = "❌"
+        self.disabled = True
+
+        winner = view.check_winner()
+        if winner:
+            view.game_over = True
+            for item in view.children:
+                item.disabled = True
+            if winner == "draw":
+                msg = "Mm... it's a draw here! One played well ehehe."
+            else:
+                msg = "Eek— one won?! Nisama needs to analyze this more ehehe. Good game!"
+            await interaction.response.edit_message(content=view.render_board() + f"\n\n{msg}", view=view)
+            return
+
+        # Nisama move
+        view.nisama_move()
+
+        # Update buttons after Nisama moves
+        for item in view.children:
+            if isinstance(item, TicTacToeButton):
+                if view.board[item.index] == "O":
+                    item.style = discord.ButtonStyle.primary
+                    item.label = "⭕"
+                    item.disabled = True
+
+        winner = view.check_winner()
+        if winner:
+            view.game_over = True
+            for item in view.children:
+                item.disabled = True
+            if winner == "draw":
+                msg = "Mm... it's a draw here! One played well ehehe."
+            else:
+                msg = "Ahehe! Nisama wins this one here! Good game though ehehe."
+            await interaction.response.edit_message(content=view.render_board() + f"\n\n{msg}", view=view)
+            return
+
+        await interaction.response.edit_message(
+            content="Nisama moved here! One's turn ehehe.\n" + view.render_board(),
+            view=view
+        )
 
 
 # Slashes
@@ -182,6 +313,46 @@ async def slash_pat(interaction: discord.Interaction):
         "Ah— ehehe! Nisama is a little flustered now here. But really thanksie.",
     ]
     await interaction.response.send_message(random.choice(responses))
+
+
+@bot.tree.command(name="tictactoe", description="Play tic tac toe with Nisama")
+async def slash_tictactoe(interaction: discord.Interaction):
+    log_slash_command(str(interaction.user.id), "tictactoe")
+    view = TicTacToeView()
+    await interaction.response.send_message(
+        "Ah— tic tac toe! Nisama is ready here. One goes first ehehe.\n" + view.render_board(),
+        view=view
+    )
+
+
+@bot.tree.command(name="sendmessage", description="Send a message to someone through Nisama")
+@app_commands.describe(
+    user="The user to send the message to",
+    message="The message to deliver"
+)
+async def slash_sendmessage(interaction: discord.Interaction, user: discord.User, message: str):
+    log_slash_command(str(interaction.user.id), "sendmessage")
+
+    sender_profile = get_user_profile(str(interaction.user.id))
+    sender_name = sender_profile["known_as"] if sender_profile and sender_profile["known_as"] else "someone"
+
+    delivery = (
+        f"Greetings there! Nisama has a message here from {sender_name}!\n\n"
+        f"{message}\n\n"
+        f"Nisama hopes one is doing well here ehehe."
+    )
+
+    try:
+        await user.send(delivery)
+        await interaction.response.send_message(
+            f"Nisama delivered the message to {user.display_name} here ehehe!",
+            ephemeral=True
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            f"Mm... Nisama could not reach {user.display_name} here. One might have DMs closed.",
+            ephemeral=True
+        )
 
 
 # Events
