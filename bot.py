@@ -246,11 +246,10 @@ class UltimateTTTGame:
             rows.append(" ".join(row))
         return "\n".join(rows)
 
-    def build_message(self, status: str = None) -> dict:
+    def build_message(self, status: str = None) -> tuple:
         playable = self.get_playable_boards()
         active = self.active_board if self.active_board is not None and not self.game_over else (playable[0] if playable else 0)
 
-        # Header
         if self.game_over:
             if self.global_winner == "X":
                 header = "Eek— one won the whole thing?! Nisama needs to analyze this more ehehe. Amazing game!"
@@ -266,7 +265,7 @@ class UltimateTTTGame:
                 header += f"\n\n{status}"
 
         view = UltimateTTTView(self, active if not self.game_over else None)
-        return {"content": header, "view": view}
+        return header, view
 
 
 class UltimateTTTView(discord.ui.View):
@@ -321,7 +320,8 @@ class UltimateTTTView(discord.ui.View):
             if gw:
                 game.game_over = True
                 game.global_winner = gw
-                await interaction.response.edit_message(**game.build_message())
+                content, view = game.build_message()
+                await interaction.response.edit_message(content=content, view=view)
                 return
 
             # Nisama move
@@ -337,7 +337,8 @@ class UltimateTTTView(discord.ui.View):
                 if gw:
                     game.game_over = True
                     game.global_winner = gw
-                    await interaction.response.edit_message(**game.build_message())
+                    content, view = game.build_message()
+                    await interaction.response.edit_message(content=content, view=view)
                     return
 
             # Continue — show next active board
@@ -345,12 +346,14 @@ class UltimateTTTView(discord.ui.View):
             if not playable:
                 game.game_over = True
                 game.global_winner = "draw"
-                await interaction.response.edit_message(**game.build_message())
+                content, view = game.build_message()
+                await interaction.response.edit_message(content=content, view=view)
                 return
 
             next_active = game.active_board if game.active_board is not None else playable[0]
             status = f"Nisama moved! Now playing in board **{next_active + 1}** here ehehe."
-            await interaction.response.edit_message(**game.build_message(status=status))
+            content, view = game.build_message(status=status)
+            await interaction.response.edit_message(content=content, view=view)
 
         return callback
 
@@ -446,10 +449,10 @@ async def slash_lore(interaction: discord.Interaction):
 @bot.tree.command(name="tictactoe", description="Play Super Tic Tac Toe with Nisama")
 async def slash_tictactoe(interaction: discord.Interaction):
     log_slash_command(str(interaction.user.id), "tictactoe")
+    await interaction.response.defer()
     game = UltimateTTTGame()
-    await interaction.response.send_message(
-        **game.build_message()
-    )
+    content, view = game.build_message()
+    await interaction.followup.send(content=content, view=view)
 
 
 # Events
