@@ -448,11 +448,7 @@ async def slash_lore(interaction: discord.Interaction):
 
 @bot.tree.command(name="tictactoe", description="Play Super Tic Tac Toe with Nisama")
 async def slash_tictactoe(interaction: discord.Interaction):
-    await interaction.response.defer()
-    game = UltimateTTTGame()
-    content, view = game.build_message()
-    await interaction.followup.send(content=content, view=view)
-    asyncio.create_task(asyncio.to_thread(log_slash_command, str(interaction.user.id), "tictactoe"))
+    await interaction.response.send_message("test")
 
 
 # Events
