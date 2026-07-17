@@ -21,6 +21,21 @@ def init_db():
             ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_update_log (
+            user_id TEXT NOT NULL,
+            version TEXT NOT NULL,
+            PRIMARY KEY (user_id, version)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS slash_command_log (
+            id SERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            command TEXT NOT NULL,
+            ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     con.commit()
     cur.close()
     con.close()
@@ -86,20 +101,6 @@ def get_global_memory(limit: int = 30) -> list:
     con.close()
     return [{"name": r[0], "fact": r[1], "ts": str(r[2])} for r in rows]
 
-def get_facts_about_user(about_user_id: str) -> list:
-    con = get_conn()
-    cur = con.cursor()
-    cur.execute(
-        """SELECT fact FROM global_memory
-           WHERE about_user_id = %s
-           ORDER BY ts DESC LIMIT 20""",
-        (about_user_id,)
-    )
-    rows = cur.fetchall()
-    cur.close()
-    con.close()
-    return [r[0] for r in rows]
-
 def save_user_profile(user_id: str, display_name: str, known_as: str = None):
     con = get_conn()
     cur = con.cursor()
@@ -150,44 +151,9 @@ def get_active_users(minutes: int = 10) -> list:
     con.close()
     return [{"name": r[0], "fact": r[1]} for r in rows]
 
-def has_broadcast_sent(version: str) -> bool:
-    con = get_conn()
-    cur = con.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS broadcast_log (
-            version TEXT PRIMARY KEY,
-            sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    con.commit()
-    cur.execute("SELECT version FROM broadcast_log WHERE version = %s", (version,))
-    result = cur.fetchone()
-    cur.close()
-    con.close()
-    return result is not None
-
-def mark_broadcast_sent(version: str):
-    con = get_conn()
-    cur = con.cursor()
-    cur.execute(
-        "INSERT INTO broadcast_log (version) VALUES (%s) ON CONFLICT DO NOTHING",
-        (version,)
-    )
-    con.commit()
-    cur.close()
-    con.close()
-
 def has_seen_update(user_id: str, version: str) -> bool:
     con = get_conn()
     cur = con.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS user_update_log (
-            user_id TEXT NOT NULL,
-            version TEXT NOT NULL,
-            PRIMARY KEY (user_id, version)
-        )
-    """)
-    con.commit()
     cur.execute(
         "SELECT 1 FROM user_update_log WHERE user_id = %s AND version = %s",
         (user_id, version)
@@ -208,27 +174,9 @@ def mark_update_seen(user_id: str, version: str):
     cur.close()
     con.close()
 
-def get_all_user_ids() -> list:
-    con = get_conn()
-    cur = con.cursor()
-    cur.execute("SELECT DISTINCT user_id FROM history")
-    rows = cur.fetchall()
-    cur.close()
-    con.close()
-    return [r[0] for r in rows]
-
 def log_slash_command(user_id: str, command: str):
     con = get_conn()
     cur = con.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS slash_command_log (
-            id SERIAL PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            command TEXT NOT NULL,
-            ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    con.commit()
     cur.execute(
         "INSERT INTO slash_command_log (user_id, command) VALUES (%s, %s)",
         (user_id, command)

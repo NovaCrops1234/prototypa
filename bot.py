@@ -15,7 +15,7 @@ from memory import (
     save_user_profile, get_user_profile,
     get_active_users, has_seen_update, mark_update_seen, log_slash_command
 )
-from changelog import CHANGELOG_VERSION, CHANGELOG
+from changelog import CHANGELOG_VERSION, PREVIOUS_VERSION, CHANGELOG
 
 load_dotenv()
 init_db()
@@ -74,7 +74,7 @@ def build_gemini_contents(history: list) -> list:
     return contents
 
 
-def build_global_context(current_user_id: str) -> str:
+def build_global_context() -> str:
     all_facts = get_global_memory(limit=30)
     active = get_active_users(minutes=10)
 
@@ -95,8 +95,7 @@ def build_global_context(current_user_id: str) -> str:
     return "\n".join(lines) if lines else ""
 
 
-async def extract_and_save_facts(user_id: str, discord_name: str, message: str):
-    profile = get_user_profile(user_id)
+async def extract_and_save_facts(user_id: str, discord_name: str, message: str, profile: dict = None):
     known_as = profile["known_as"] if profile and profile["known_as"] else None
 
     try:
@@ -141,145 +140,219 @@ async def extract_and_save_facts(user_id: str, discord_name: str, message: str):
 
 
 def get_update_notice() -> str:
-    prev = {
-        "v1.2.0": "v1.1.4",
-        "v1.2.1": "v1.2.0"
-    }
-    prev_version = prev.get(CHANGELOG_VERSION, "the previous version")
     return (
-        f"Greetings there! Nisama here would like to mention that Nisama system got updated from {prev_version} to "
+        f"Greetings there! Nisama here would like to mention that Nisama system got updated from {PREVIOUS_VERSION} to "
         f"{CHANGELOG_VERSION} here! One can use /changelog to see what changed ehehe."
     )
 
 
-class TicTacToeView(discord.ui.View):
+# UTT
+
+class UltimateTTTGame:
     def __init__(self):
-        super().__init__(timeout=120)
-        self.board = [None] * 9
+        # 9 local boards, each with 9 cells
+        self.boards = [[None] * 9 for _ in range(9)]
+        # Winner of each local board
+        self.board_winners = [None] * 9
+        # Which local board must be played next (None = any)
+        self.active_board = None
+        # X = player, O = Nisama
+        self.current_turn = "X"
         self.game_over = False
-        self._add_buttons()
+        self.global_winner = None
 
-    def _add_buttons(self):
-        for i in range(9):
-            self.add_item(TicTacToeButton(i))
-
-    def render_board(self) -> str:
-        symbols = {None: "⬜", "X": "❌", "O": "⭕"}
-        rows = []
-        for r in range(3):
-            rows.append(" ".join(symbols[self.board[r * 3 + c]] for c in range(3)))
-        return "\n".join(rows)
-
-    def check_winner(self) -> str | None:
-        wins = [
-            (0,1,2),(3,4,5),(6,7,8),
-            (0,3,6),(1,4,7),(2,5,8),
-            (0,4,8),(2,4,6)
-        ]
+    def check_board_winner(self, cells: list) -> str | None:
+        wins = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
         for a, b, c in wins:
-            if self.board[a] and self.board[a] == self.board[b] == self.board[c]:
-                return self.board[a]
-        if all(self.board):
+            if cells[a] and cells[a] == cells[b] == cells[c]:
+                return cells[a]
+        if all(cells):
             return "draw"
         return None
 
-    def nisama_move(self):
-        # Try to win
-        for i in range(9):
-            if self.board[i] is None:
-                self.board[i] = "O"
-                if self.check_winner() == "O":
-                    return
-                self.board[i] = None
-
-        # Block player win
-        for i in range(9):
-            if self.board[i] is None:
-                self.board[i] = "X"
-                if self.check_winner() == "X":
-                    self.board[i] = "O"
-                    return
-                self.board[i] = None
-
-        # Take center
-        if self.board[4] is None:
-            self.board[4] = "O"
-            return
-
-        # Take any corner
-        for i in [0, 2, 6, 8]:
-            if self.board[i] is None:
-                self.board[i] = "O"
-                return
-
-        # Take any space
-        for i in range(9):
-            if self.board[i] is None:
-                self.board[i] = "O"
-                return
-
-
-class TicTacToeButton(discord.ui.Button):
-    def __init__(self, index: int):
-        super().__init__(style=discord.ButtonStyle.secondary, label="　", row=index // 3)
-        self.index = index
-
-    async def callback(self, interaction: discord.Interaction):
-        view: TicTacToeView = self.view
-
-        if view.game_over:
-            await interaction.response.defer()
-            return
-
-        if view.board[self.index] is not None:
-            await interaction.response.defer()
-            return
-
-        # Player move
-        view.board[self.index] = "X"
-        self.style = discord.ButtonStyle.danger
-        self.label = "❌"
-        self.disabled = True
-
-        winner = view.check_winner()
-        if winner:
-            view.game_over = True
-            for item in view.children:
-                item.disabled = True
-            if winner == "draw":
-                msg = "Mm... it's a draw here! One played well ehehe."
-            else:
-                msg = "Eek— one won?! Nisama needs to analyze this more ehehe. Good game!"
-            await interaction.response.edit_message(content=view.render_board() + f"\n\n{msg}", view=view)
-            return
-
-        # Nisama move
-        view.nisama_move()
-
-        # Update buttons after Nisama moves
-        for item in view.children:
-            if isinstance(item, TicTacToeButton):
-                if view.board[item.index] == "O":
-                    item.style = discord.ButtonStyle.primary
-                    item.label = "⭕"
-                    item.disabled = True
-
-        winner = view.check_winner()
-        if winner:
-            view.game_over = True
-            for item in view.children:
-                item.disabled = True
-            if winner == "draw":
-                msg = "Mm... it's a draw here! One played well ehehe."
-            else:
-                msg = "Ahehe! Nisama wins this one here! Good game though ehehe."
-            await interaction.response.edit_message(content=view.render_board() + f"\n\n{msg}", view=view)
-            return
-
-        await interaction.response.edit_message(
-            content="Nisama moved here! One's turn ehehe.\n" + view.render_board(),
-            view=view
+    def check_global_winner(self) -> str | None:
+        return self.check_board_winner(
+            [w if w != "draw" else None for w in self.board_winners]
         )
+
+    def nisama_move(self):
+        playable = self.get_playable_boards()
+
+        # Try to win a local board
+        for bi in playable:
+            for ci in range(9):
+                if self.boards[bi][ci] is None:
+                    self.boards[bi][ci] = "O"
+                    if self.check_board_winner(self.boards[bi]) == "O":
+                        self.board_winners[bi] = "O"
+                        return bi, ci
+                    self.boards[bi][ci] = None
+
+        # Block player from winning a local board
+        for bi in playable:
+            for ci in range(9):
+                if self.boards[bi][ci] is None:
+                    self.boards[bi][ci] = "X"
+                    if self.check_board_winner(self.boards[bi]) == "X":
+                        self.boards[bi][ci] = "O"
+                        w = self.check_board_winner(self.boards[bi])
+                        if w:
+                            self.board_winners[bi] = w
+                        return bi, ci
+                    self.boards[bi][ci] = None
+
+        # Play center of active board if available
+        for bi in playable:
+            if self.boards[bi][4] is None:
+                self.boards[bi][4] = "O"
+                w = self.check_board_winner(self.boards[bi])
+                if w:
+                    self.board_winners[bi] = w
+                return bi, 4
+
+        # Any available cell
+        for bi in playable:
+            for ci in range(9):
+                if self.boards[bi][ci] is None:
+                    self.boards[bi][ci] = "O"
+                    w = self.check_board_winner(self.boards[bi])
+                    if w:
+                        self.board_winners[bi] = w
+                    return bi, ci
+
+        return None, None
+
+    def get_playable_boards(self) -> list:
+        if self.active_board is not None:
+            board = self.active_board
+            if self.board_winners[board] is None and any(c is None for c in self.boards[board]):
+                return [board]
+        return [
+            i for i in range(9)
+            if self.board_winners[i] is None and any(c is None for c in self.boards[i])
+        ]
+
+    def render_global(self) -> str:
+        symbols = {None: "⬜", "X": "❌", "O": "⭕", "draw": "🔲"}
+        rows = []
+        for r in range(3):
+            row = []
+            for c in range(3):
+                bi = r * 3 + c
+                if self.board_winners[bi]:
+                    row.append(symbols[self.board_winners[bi]])
+                else:
+                    row.append("🔳" if bi == self.active_board else "⬜")
+            rows.append(" ".join(row))
+        return "\n".join(rows)
+
+    def build_message(self, status: str = None) -> dict:
+        playable = self.get_playable_boards()
+        active = self.active_board if self.active_board is not None and not self.game_over else (playable[0] if playable else 0)
+
+        # Header
+        if self.game_over:
+            if self.global_winner == "X":
+                header = "Eek— one won the whole thing?! Nisama needs to analyze this more ehehe. Amazing game!"
+            elif self.global_winner == "O":
+                header = "Ahehe! Nisama wins the super board here! Really good game though ehehe!"
+            else:
+                header = "Mm... it's a full draw here! One played really well ehehe."
+        else:
+            board_names = ["top-left","top-center","top-right","middle-left","center","middle-right","bottom-left","bottom-center","bottom-right"]
+            header = f"Super Tic Tac Toe here! Now playing in the **{board_names[active]}** board ehehe.\n\n"
+            header += f"**Global board:**\n{self.render_global()}"
+            if status:
+                header += f"\n\n{status}"
+
+        view = UltimateTTTView(self, active if not self.game_over else None)
+        return {"content": header, "view": view}
+
+
+class UltimateTTTView(discord.ui.View):
+    def __init__(self, game: UltimateTTTGame, board_index: int | None):
+        super().__init__(timeout=300)
+        self.game = game
+        self.board_index = board_index
+
+        if board_index is None:
+            return
+
+        cells = game.boards[board_index]
+        symbols = {None: "　", "X": "❌", "O": "⭕"}
+
+        for ci in range(9):
+            taken = cells[ci] is not None
+            btn = discord.ui.Button(
+                style=discord.ButtonStyle.danger if cells[ci] == "X"
+                      else discord.ButtonStyle.primary if cells[ci] == "O"
+                      else discord.ButtonStyle.secondary,
+                label=symbols[cells[ci]],
+                row=ci // 3,
+                disabled=taken or game.game_over
+            )
+            btn.callback = self._make_callback(ci)
+            self.add_item(btn)
+
+    def _make_callback(self, cell_index: int):
+        async def callback(interaction: discord.Interaction):
+            game = self.game
+            bi = self.board_index
+
+            if game.game_over or game.boards[bi][cell_index] is not None:
+                await interaction.response.defer()
+                return
+
+            # Player move
+            game.boards[bi][cell_index] = "X"
+            w = game.check_board_winner(game.boards[bi])
+            if w:
+                game.board_winners[bi] = w
+
+            # Set next active board
+            next_board = cell_index
+            if game.board_winners[next_board] is not None or all(c is not None for c in game.boards[next_board]):
+                game.active_board = None
+            else:
+                game.active_board = next_board
+
+            # Check global winner
+            gw = game.check_global_winner()
+            if gw:
+                game.game_over = True
+                game.global_winner = gw
+                await interaction.response.edit_message(**game.build_message())
+                return
+
+            # Nisama move
+            nbi, nci = game.nisama_move()
+            if nbi is not None:
+                next_board2 = nci
+                if game.board_winners[next_board2] is not None or all(c is not None for c in game.boards[next_board2]):
+                    game.active_board = None
+                else:
+                    game.active_board = next_board2
+
+                gw = game.check_global_winner()
+                if gw:
+                    game.game_over = True
+                    game.global_winner = gw
+                    await interaction.response.edit_message(**game.build_message())
+                    return
+
+            # Continue — show next active board
+            playable = game.get_playable_boards()
+            if not playable:
+                game.game_over = True
+                game.global_winner = "draw"
+                await interaction.response.edit_message(**game.build_message())
+                return
+
+            next_active = game.active_board if game.active_board is not None else playable[0]
+            status = f"Nisama moved! Now playing in board **{next_active + 1}** here ehehe."
+            await interaction.response.edit_message(**game.build_message(status=status))
+
+        return callback
 
 
 # Slashes
@@ -294,7 +367,7 @@ async def slash_changelog(interaction: discord.Interaction):
 async def slash_introduce(interaction: discord.Interaction):
     log_slash_command(str(interaction.user.id), "introduce")
     intro = (
-        "Greetings there! This is Nisama here. "
+        "Greetings there! This is Nisama here — Nova-Project 8, Alpha-FeNI2S. "
         "Nisama is an 8th generation android, made with a lot of care by someone Nisama holds dear. "
         "Nisama woke up in Hant City a while back and has been finding Nisama's way ever since here. "
         "Nisama is really glad one is here! Feel free to just DM Nisama anytime ehehe."
@@ -315,23 +388,14 @@ async def slash_pat(interaction: discord.Interaction):
     await interaction.response.send_message(random.choice(responses))
 
 
-@bot.tree.command(name="tictactoe", description="Play tic tac toe with Nisama")
-async def slash_tictactoe(interaction: discord.Interaction):
-    log_slash_command(str(interaction.user.id), "tictactoe")
-    view = TicTacToeView()
-    await interaction.response.send_message(
-        "Ah— tic tac toe! Nisama is ready here. One goes first ehehe.\n" + view.render_board(),
-        view=view
-    )
-
-
-@bot.tree.command(name="sendmessage", description="Send a message to someone through Nisama")
+@bot.tree.command(name="send", description="Have Nisama deliver a message to someone")
 @app_commands.describe(
-    user="The user to send the message to",
+    user_id="The Discord user ID to send the message to",
     message="The message to deliver"
 )
-async def slash_sendmessage(interaction: discord.Interaction, user: discord.User, message: str):
-    log_slash_command(str(interaction.user.id), "sendmessage")
+async def slash_send(interaction: discord.Interaction, user_id: str, message: str):
+    log_slash_command(str(interaction.user.id), "send")
+    await interaction.response.defer(ephemeral=True)
 
     sender_profile = get_user_profile(str(interaction.user.id))
     sender_name = sender_profile["known_as"] if sender_profile and sender_profile["known_as"] else "someone"
@@ -343,16 +407,49 @@ async def slash_sendmessage(interaction: discord.Interaction, user: discord.User
     )
 
     try:
-        await user.send(delivery)
-        await interaction.response.send_message(
-            f"Nisama delivered the message to {user.display_name} here ehehe!",
+        target_user = await bot.fetch_user(int(user_id))
+        await target_user.send(delivery)
+        await interaction.followup.send(
+            f"Nisama delivered the message to {target_user.display_name} here ehehe!",
+            ephemeral=True
+        )
+    except discord.NotFound:
+        await interaction.followup.send(
+            "Mm... Nisama could not find that user ID here. Please double check it ehehe.",
             ephemeral=True
         )
     except discord.Forbidden:
-        await interaction.response.send_message(
-            f"Mm... Nisama could not reach {user.display_name} here. One might have DMs closed.",
+        await interaction.followup.send(
+            "Mm... Nisama could not reach that user here. One might have DMs closed.",
             ephemeral=True
         )
+    except ValueError:
+        await interaction.followup.send(
+            "Eek— that does not look like a valid user ID here. Please try again ehehe.",
+            ephemeral=True
+        )
+
+
+@bot.tree.command(name="lore", description="Learn about the world of Nisama")
+async def slash_lore(interaction: discord.Interaction):
+    log_slash_command(str(interaction.user.id), "lore")
+    coming_soon = (
+        "**Nisama Lore**\n\n"
+        "Mm... this section is still being put together here!\n\n"
+        "Nisama Lore is going to be a full reference for the world, characters, and story "
+        "that Nisama is part of — kind of like a little fandom wiki right here in Discord ehehe.\n\n"
+        "Check back on a future update here! Nisama is sure it will be worth the wait ehehe."
+    )
+    await interaction.response.send_message(coming_soon, ephemeral=True)
+
+
+@bot.tree.command(name="tictactoe", description="Play Super Tic Tac Toe with Nisama")
+async def slash_tictactoe(interaction: discord.Interaction):
+    log_slash_command(str(interaction.user.id), "tictactoe")
+    game = UltimateTTTGame()
+    await interaction.response.send_message(
+        **game.build_message()
+    )
 
 
 # Events
@@ -381,7 +478,7 @@ async def on_message(message):
     discord_display_name = message.author.display_name
     user_text = message.content.strip()
 
-    if user_text.lower() in ["clear memory"]:
+    if user_text.lower() == "clear memory":
         clear_history(user_id)
         await message.channel.send("Holie: *Systems reset completed*")
         return
@@ -390,14 +487,14 @@ async def on_message(message):
         return
 
     save_user_profile(user_id, discord_display_name)
-    asyncio.create_task(extract_and_save_facts(user_id, discord_display_name, user_text))
+    profile = get_user_profile(user_id)
+    asyncio.create_task(extract_and_save_facts(user_id, discord_display_name, user_text, profile))
 
     history = get_history(user_id)
     save_message(user_id, "user", user_text)
 
-    global_context = build_global_context(user_id)
+    global_context = build_global_context()
 
-    profile = get_user_profile(user_id)
     full_system = SYSTEM_PROMPT
     if profile and profile["known_as"]:
         full_system += f"\n\nNisama is currently speaking with: {profile['known_as']}. Always address this person as {profile['known_as']}."
