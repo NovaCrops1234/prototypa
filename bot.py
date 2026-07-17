@@ -278,15 +278,13 @@ class UltimateTTTView(discord.ui.View):
             return
 
         cells = game.boards[board_index]
-        symbols = {None: "　", "X": "❌", "O": "⭕"}
+        symbols = {"X": "❌", "O": "⭕"}
 
         for ci in range(9):
             taken = cells[ci] is not None
             btn = discord.ui.Button(
-                style=discord.ButtonStyle.danger if cells[ci] == "X"
-                      else discord.ButtonStyle.primary if cells[ci] == "O"
-                      else discord.ButtonStyle.secondary,
-                label=symbols[cells[ci]],
+                style=discord.ButtonStyle.secondary,
+                label=symbols[cells[ci]] if cells[ci] else "·",
                 row=ci // 3,
                 disabled=taken or game.game_over
             )
