@@ -36,6 +36,15 @@ def init_db():
             ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS send_log (
+            id SERIAL PRIMARY KEY,
+            sender_id TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            message_preview TEXT,
+            ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     con.commit()
     cur.close()
     con.close()
@@ -184,3 +193,59 @@ def log_slash_command(user_id: str, command: str):
     con.commit()
     cur.close()
     con.close()
+
+def log_send_command(sender_id: str, target_id: str, message_preview: str):
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS send_log (
+            id SERIAL PRIMARY KEY,
+            sender_id TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            message_preview TEXT,
+            ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    con.commit()
+    cur.execute(
+        "INSERT INTO send_log (sender_id, target_id, message_preview) VALUES (%s, %s, %s)",
+        (sender_id, target_id, message_preview[:100])
+    )
+    con.commit()
+    cur.close()
+    con.close()
+
+def get_slash_stats() -> dict:
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT command, COUNT(*) as count
+        FROM slash_command_log
+        GROUP BY command
+        ORDER BY count DESC
+    """)
+    commands = {r[0]: r[1] for r in cur.fetchall()}
+
+    cur.execute("""
+        SELECT user_id, COUNT(*) as count
+        FROM history
+        WHERE role = 'user'
+        GROUP BY user_id
+        ORDER BY count DESC
+        LIMIT 3
+    """)
+    top_users_raw = cur.fetchall()
+
+    top_users = []
+    for uid, count in top_users_raw:
+        cur.execute(
+            "SELECT known_as FROM user_profiles WHERE user_id = %s",
+            (uid,)
+        )
+        row = cur.fetchone()
+        name = row[0] if row and row[0] else "unknown one"
+        top_users.append({"name": name, "count": count})
+
+    cur.close()
+    con.close()
+    return {"commands": commands, "top_users": top_users}
