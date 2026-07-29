@@ -14,7 +14,10 @@ from memory import (
     save_global_fact, get_global_memory,
     save_user_profile, get_user_profile,
     get_active_users, has_seen_update, mark_update_seen,
-    log_slash_command, log_send_command, get_slash_stats
+    log_slash_command, log_send_command, get_slash_stats,
+    get_proactive_enabled_users, set_proactive_enabled,
+    update_last_proactive_ts, get_proactive_setting,
+    clean_slash_stats
 )
 from changelog import CHANGELOG_VERSION, PREVIOUS_VERSION, CHANGELOG
 
@@ -57,6 +60,28 @@ Output: []
 
 Input: "Just got back from Hant City ruins, doing some scouting for J-san"
 Output: ["Recently visited Hant City ruins", "Doing scouting work for J-san"]
+"""
+
+PROACTIVE_DECISION_PROMPT = """
+You are Nisama, an android who may choose to send a message to a friend.
+Given context about this person and the current time, decide:
+1. Should Nisama send a message right now? (yes/no)
+2. If yes, what would Nisama say?
+
+Consider:
+- Time of day in GMT+8 (avoid messaging between 12am-7am)
+- How long since last conversation
+- What Nisama knows about this person
+- Nisama's current mood and activities
+- Natural human conversation patterns — don't over-message
+
+Reply ONLY in this JSON format:
+{
+  "should_message": true/false,
+  "message": "what Nisama would say, or empty string if should_message is false"
+}
+
+Keep the message short, warm, and in Nisama's voice. No asterisk actions.
 """
 
 
@@ -147,6 +172,83 @@ def get_update_notice() -> str:
     )
 
 
+async def run_proactive_messaging():
+    """Background task that runs every 30 minutes to check if Nisama should message anyone."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            from datetime import datetime, timezone, timedelta
+            gmt8 = timezone(timedelta(hours=8))
+            now_gmt8 = datetime.now(gmt8)
+            hour = now_gmt8.hour
+
+            # Skip messaging between midnight and 7am GMT+8
+            if 0 <= hour < 7:
+                await asyncio.sleep(1800)
+                continue
+
+            users = get_proactive_enabled_users()
+            for u in users:
+                try:
+                    user_id = u["user_id"]
+                    known_as = u["known_as"] or "unknown one"
+                    last_msg = u["last_message_ts"]
+                    last_proactive = u["last_proactive_ts"]
+
+                    # Build context for AI decision
+                    hours_since_last = 999
+                    if last_msg:
+                        diff = datetime.now(timezone.utc) - last_msg.replace(tzinfo=timezone.utc)
+                        hours_since_last = diff.total_seconds() / 3600
+
+                    hours_since_proactive = 999
+                    if last_proactive:
+                        diff2 = datetime.now(timezone.utc) - last_proactive.replace(tzinfo=timezone.utc)
+                        hours_since_proactive = diff2.total_seconds() / 3600
+
+                    context = (
+                        f"Person's name: {known_as}\n"
+                        f"Current time (GMT+8): {now_gmt8.strftime('%A, %H:%M')}\n"
+                        f"Hours since last conversation: {hours_since_last:.1f}\n"
+                        f"Hours since Nisama last initiated: {hours_since_proactive:.1f}\n"
+                        f"Nisama's current life: {SYSTEM_PROMPT[:500]}"
+                    )
+
+                    response = client_ai.models.generate_content(
+                        model="gemini-3.1-flash-lite",
+                        contents=[types.Content(
+                            role="user",
+                            parts=[types.Part(text=context)]
+                        )],
+                        config=types.GenerateContentConfig(
+                            system_instruction=PROACTIVE_DECISION_PROMPT,
+                            max_output_tokens=300,
+                            temperature=0.9
+                        )
+                    )
+
+                    raw = response.text.strip()
+                    if raw.startswith("```"):
+                        raw = raw.split("```")[1]
+                        if raw.startswith("json"):
+                            raw = raw[4:]
+                    decision = json.loads(raw.strip())
+
+                    if decision.get("should_message") and decision.get("message"):
+                        discord_user = await bot.fetch_user(int(user_id))
+                        await discord_user.send(decision["message"])
+                        update_last_proactive_ts(user_id)
+                        print(f"Proactive message sent to {known_as}")
+
+                except Exception as e:
+                    print(f"Proactive error for {u.get('user_id')}: {e}")
+
+        except Exception as e:
+            print(f"Proactive task error: {e}")
+
+        await asyncio.sleep(1800)  # Check every 30 minutes
+
+
 # TTT
 
 class TicTacToeView(discord.ui.View):
@@ -172,11 +274,11 @@ class TicTacToeView(discord.ui.View):
             if winner == "X":
                 title = "❌ One wins!"
                 desc = "Eek— one won?! Nisama needs to analyze this more ehehe. Good game!"
-                color = discord.Color.red()
+                color = discord.Color.green()
             elif winner == "O":
                 title = "⭕ Nisama wins!"
                 desc = "Ahehe! Nisama wins here! Good game though ehehe!"
-                color = discord.Color.blue()
+                color = discord.Color.red()
             else:
                 title = "🔲 Draw!"
                 desc = "Mm... it's a draw here! One played well ehehe."
@@ -385,11 +487,11 @@ class UltimateTTTGame:
             if self.global_winner == "X":
                 title = "❌ One wins the Super Board!"
                 desc = "Eek— one won the whole thing?! Nisama needs to analyze this more ehehe. Amazing game!"
-                color = discord.Color.red()
+                color = discord.Color.green()
             elif self.global_winner == "O":
                 title = "⭕ Nisama wins the Super Board!"
                 desc = "Ahehe! Nisama wins here! Really good game though ehehe!"
-                color = discord.Color.blue()
+                color = discord.Color.red()
             else:
                 title = "🔲 Full Draw!"
                 desc = "Mm... it's a full draw here! One played really well ehehe."
@@ -707,7 +809,77 @@ async def slash_stats(interaction: discord.Interaction):
     asyncio.create_task(asyncio.to_thread(log_slash_command, str(interaction.user.id), "stats"))
 
 
+# @bot.tree.command(name="sentient", description="Toggle Nisama's proactive messaging on or off")
+# async def slash_sentient(interaction: discord.Interaction):
+#     await interaction.response.defer(ephemeral=True)
+#     user_id = str(interaction.user.id)
+#     current = get_proactive_setting(user_id)
+#     new_state = not current
+#     set_proactive_enabled(user_id, new_state)
+# 
+#     if new_state:
+#         msg = "Nisama's proactive messaging is now **on** here! Nisama may reach out when the moment feels right ehehe."
+#     else:
+#         msg = "Nisama's proactive messaging is now **off** here. Nisama will wait for one to reach out first ehehe."
+# 
+#     await interaction.followup.send(msg, ephemeral=True)
+#     asyncio.create_task(asyncio.to_thread(log_slash_command, user_id, "sentient"))
+
+
+@bot.tree.command(name="voice", description="Have Nisama join your voice channel")
+async def slash_voice(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    asyncio.create_task(asyncio.to_thread(log_slash_command, str(interaction.user.id), "voice"))
+
+    if not interaction.guild:
+        await interaction.followup.send(
+            "Mm... this command needs to be used in a server here, not in DMs ehehe.",
+            ephemeral=True
+        )
+        return
+
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.followup.send(
+            "Eek— one doesn't seem to be in a voice channel here. Please join one first ehehe!",
+            ephemeral=True
+        )
+        return
+
+    channel = interaction.user.voice.channel
+
+    # Leave any existing voice connection in this guild
+    if interaction.guild.voice_client:
+        await interaction.guild.voice_client.disconnect()
+
+    await channel.connect()
+    await interaction.followup.send(
+        f"Nisama joined **{channel.name}** here! Nisama will leave if one is no longer there ehehe.",
+        ephemeral=True
+    )
+
+    # Start idle watcher
+    bot.loop.create_task(voice_idle_watcher(interaction.guild, channel))
+
+
+async def voice_idle_watcher(guild: discord.Guild, channel):
+    """Leave voice channel if empty for 3 minutes."""
+    await asyncio.sleep(30)
+    while True:
+        vc = guild.voice_client
+        if not vc or not vc.is_connected():
+            break
+        # Count non-bot members in channel
+        members = [m for m in channel.members if not m.bot]
+        if not members:
+            await vc.disconnect()
+            print(f"Left voice channel {channel.name} — no users present.")
+            break
+        await asyncio.sleep(30)
+
+
 # Events
+
+VALID_COMMANDS = ["changelog", "introduce", "pat", "send", "lore", "ttt", "utt", "stats", "voice"]
 
 @bot.event
 async def on_ready():
@@ -719,6 +891,12 @@ async def on_ready():
         print(f"Synced {len(synced)} slash commands.")
     except Exception as e:
         print(f"Slash command sync error: {e}")
+
+    # Clean stale command logs
+    asyncio.create_task(asyncio.to_thread(clean_slash_stats, VALID_COMMANDS))
+
+    # Start proactive messaging background task
+    bot.loop.create_task(run_proactive_messaging())
 
 
 @bot.event
@@ -799,7 +977,12 @@ async def on_message(message):
 
     # Send update notice first if applicable
     if update_notice and not error_occurred:
-        await message.channel.send(update_notice)
+        try:
+            notice_msg = await message.channel.send(update_notice)
+            await asyncio.sleep(30)
+            await notice_msg.delete()
+        except Exception:
+            pass
 
     await message.channel.send(reply)
 

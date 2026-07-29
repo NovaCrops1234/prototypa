@@ -45,6 +45,31 @@ def init_db():
             ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_profiles (
+            user_id TEXT PRIMARY KEY,
+            display_name TEXT,
+            known_as TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS global_memory (
+            id SERIAL PRIMARY KEY,
+            about_user_id TEXT NOT NULL,
+            about_user_name TEXT,
+            fact TEXT NOT NULL,
+            ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS proactive_settings (
+            user_id TEXT PRIMARY KEY,
+            enabled BOOLEAN DEFAULT FALSE,
+            last_proactive_ts TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     con.commit()
     cur.close()
     con.close()
@@ -218,12 +243,14 @@ def log_send_command(sender_id: str, target_id: str, message_preview: str):
 def get_slash_stats() -> dict:
     con = get_conn()
     cur = con.cursor()
+    valid = ('changelog', 'introduce', 'pat', 'send', 'lore', 'ttt', 'utt', 'stats', 'sentient', 'voice')
     cur.execute("""
         SELECT command, COUNT(*) as count
         FROM slash_command_log
+        WHERE command IN %s
         GROUP BY command
         ORDER BY count DESC
-    """)
+    """, (valid,))
     commands = {r[0]: r[1] for r in cur.fetchall()}
 
     cur.execute("""
@@ -249,3 +276,77 @@ def get_slash_stats() -> dict:
     cur.close()
     con.close()
     return {"commands": commands, "top_users": top_users}
+
+def get_proactive_enabled_users() -> list:
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT ps.user_id, up.known_as, ps.last_proactive_ts,
+               MAX(h.ts) as last_message_ts
+        FROM proactive_settings ps
+        LEFT JOIN user_profiles up ON up.user_id = ps.user_id
+        LEFT JOIN history h ON h.user_id = ps.user_id
+        WHERE ps.enabled = TRUE
+        GROUP BY ps.user_id, up.known_as, ps.last_proactive_ts
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    con.close()
+    return [
+        {
+            "user_id": r[0],
+            "known_as": r[1],
+            "last_proactive_ts": r[2],
+            "last_message_ts": r[3]
+        }
+        for r in rows
+    ]
+
+def set_proactive_enabled(user_id: str, enabled: bool):
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO proactive_settings (user_id, enabled, updated_at)
+        VALUES (%s, %s, CURRENT_TIMESTAMP)
+        ON CONFLICT (user_id) DO UPDATE
+        SET enabled = EXCLUDED.enabled,
+            updated_at = CURRENT_TIMESTAMP
+    """, (user_id, enabled))
+    con.commit()
+    cur.close()
+    con.close()
+
+def update_last_proactive_ts(user_id: str):
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute("""
+        UPDATE proactive_settings
+        SET last_proactive_ts = CURRENT_TIMESTAMP
+        WHERE user_id = %s
+    """, (user_id,))
+    con.commit()
+    cur.close()
+    con.close()
+
+def get_proactive_setting(user_id: str) -> bool:
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT enabled FROM proactive_settings WHERE user_id = %s",
+        (user_id,)
+    )
+    row = cur.fetchone()
+    cur.close()
+    con.close()
+    return row[0] if row else False
+
+def clean_slash_stats(valid_commands: list) -> None:
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute(
+        "DELETE FROM slash_command_log WHERE command NOT IN %s",
+        (tuple(valid_commands),)
+    )
+    con.commit()
+    cur.close()
+    con.close()
