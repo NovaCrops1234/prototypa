@@ -70,6 +70,14 @@ def init_db():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nisama_mood (
+            id SERIAL PRIMARY KEY,
+            mood TEXT NOT NULL,
+            energy FLOAT NOT NULL,
+            ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     con.commit()
     cur.close()
     con.close()
@@ -350,3 +358,90 @@ def clean_slash_stats(valid_commands: list) -> None:
     con.commit()
     cur.close()
     con.close()
+
+def get_user_chat_patterns(user_id: str) -> dict:
+    """Analyze when a user typically chats to detect patterns."""
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT EXTRACT(HOUR FROM ts AT TIME ZONE 'Asia/Singapore') as hour,
+               COUNT(*) as count
+        FROM history
+        WHERE user_id = %s AND role = 'user'
+        GROUP BY hour
+        ORDER BY count DESC
+        LIMIT 5
+    """, (user_id,))
+    rows = cur.fetchall()
+    cur.close()
+    con.close()
+    return {"peak_hours": [int(r[0]) for r in rows]}
+
+def get_unanswered_proactive_count(user_id: str) -> int:
+    """Count how many proactive messages went unanswered."""
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT ps.last_proactive_ts, MAX(h.ts) as last_user_msg
+        FROM proactive_settings ps
+        LEFT JOIN history h ON h.user_id = ps.user_id AND h.role = 'user'
+        WHERE ps.user_id = %s
+        GROUP BY ps.last_proactive_ts
+    """, (user_id,))
+    row = cur.fetchone()
+    cur.close()
+    con.close()
+    if not row or not row[0]:
+        return 0
+    last_proactive = row[0]
+    last_user_msg = row[1]
+    if not last_user_msg:
+        return 1
+    if last_proactive.replace(tzinfo=None) > last_user_msg.replace(tzinfo=None):
+        return 1
+    return 0
+
+def save_nisama_mood(mood: str, energy: float):
+    """Save Nisama's current emotional state."""
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nisama_mood (
+            id SERIAL PRIMARY KEY,
+            mood TEXT NOT NULL,
+            energy FLOAT NOT NULL,
+            ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    con.commit()
+    cur.execute(
+        "INSERT INTO nisama_mood (mood, energy) VALUES (%s, %s)",
+        (mood, energy)
+    )
+    con.commit()
+    cur.close()
+    con.close()
+
+def get_nisama_mood() -> dict:
+    """Get Nisama's most recent mood."""
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nisama_mood (
+            id SERIAL PRIMARY KEY,
+            mood TEXT NOT NULL,
+            energy FLOAT NOT NULL,
+            ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    con.commit()
+    cur.execute("""
+        SELECT mood, energy FROM nisama_mood
+        ORDER BY ts DESC LIMIT 1
+    """)
+    row = cur.fetchone()
+    cur.close()
+    con.close()
+    if row:
+        return {"mood": row[0], "energy": row[1]}
+    return {"mood": "calm and happy", "energy": 0.7}

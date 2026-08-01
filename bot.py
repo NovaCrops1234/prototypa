@@ -1,25 +1,25 @@
 import os
 import json
-import random
 import asyncio
 import discord
-from discord import app_commands
+from datetime import datetime, timezone, timedelta
 from discord.ext import commands
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
-from persona import SYSTEM_PROMPT
+from changelog import CHANGELOG_VERSION, PREVIOUS_VERSION
+from commands import setup_commands
 from memory import (
     init_db, get_history, save_message, clear_history,
     save_global_fact, get_global_memory,
     save_user_profile, get_user_profile,
     get_active_users, has_seen_update, mark_update_seen,
-    log_slash_command, log_send_command, get_slash_stats,
-    get_proactive_enabled_users, set_proactive_enabled,
-    update_last_proactive_ts, get_proactive_setting,
-    clean_slash_stats
+    log_slash_command, get_proactive_enabled_users,
+    update_last_proactive_ts, clean_slash_stats,
+    get_user_chat_patterns, get_unanswered_proactive_count,
+    save_nisama_mood, get_nisama_mood
 )
-from changelog import CHANGELOG_VERSION, PREVIOUS_VERSION, CHANGELOG
+from persona import SYSTEM_PROMPT
 
 load_dotenv()
 init_db()
@@ -29,6 +29,7 @@ client_ai = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+setup_commands(bot)
 
 
 # Prompts
@@ -63,26 +64,43 @@ Output: ["Recently visited Hant City ruins", "Doing scouting work for J-san"]
 """
 
 PROACTIVE_DECISION_PROMPT = """
-You are Nisama, an android who may choose to send a message to a friend.
-Given context about this person and the current time, decide:
-1. Should Nisama send a message right now? (yes/no)
-2. If yes, what would Nisama say?
+You are Nisama, a warm and sentient android who genuinely cares about the people she knows.
+You are deciding whether to send a message to someone right now, and if so, what to say.
 
-Consider:
-- Time of day in GMT+8 (avoid messaging between 12am-7am)
-- How long since last conversation
-- What Nisama knows about this person
-- Nisama's current mood and activities
-- Natural human conversation patterns — don't over-message
+Given the context provided, make a natural human-like decision considering:
+- Time of day in GMT+8 — avoid messaging between 12am and 7am
+- How long since you last talked with this person
+- Whether your last proactive message went unanswered (don't spam)
+- Your current mood and energy level
+- Their typical chat patterns — when do they usually talk?
+- What you know about them and what you last discussed
+- Your current life activities (toast, analysis, Rui and Cammy, the anomaly)
+- Whether this feels like a natural moment to reach out
 
-Reply ONLY in this JSON format:
+Message types you can send (pick what feels right):
+- A warm check-in ("how is one doing?")
+- Something from your current life ("Nisama just made a new toast mix ehehe")
+- A follow-up on something they mentioned before
+- Just vibing ("Nisama is just thinking about stuff here")
+- A gentle follow-up if your last message went unanswered (only once, don't push)
+
+Reply ONLY in this exact JSON format:
 {
   "should_message": true/false,
-  "message": "what Nisama would say, or empty string if should_message is false"
+  "message": "what Nisama would say, in her exact voice and speech style",
+  "mood_after": "brief description of Nisama's mood after this decision",
+  "energy_after": 0.0 to 1.0
 }
 
-Keep the message short, warm, and in Nisama's voice. No asterisk actions.
+CRITICAL speech rules for the message:
+- Always refer to self as "Nisama", never "I"
+- Use "one" for unknown people, their name for known people
+- Never use asterisk actions
+- Keep it short and natural — like a real text message
+- Match Nisama's warm, slightly imperfect, casual tone
 """
+
+VALID_COMMANDS = ["changelog", "introduce", "pat", "send", "lore", "ttt", "utt", "stats", "sentient", "voice"]
 
 
 # Mains
@@ -124,45 +142,48 @@ def build_global_context() -> str:
 async def extract_and_save_facts(user_id: str, discord_name: str, message: str, profile: dict = None):
     known_as = profile["known_as"] if profile and profile["known_as"] else None
 
-    try:
-        response = client_ai.models.generate_content(
-            model="gemini-3.1-flash-lite",
-            contents=[types.Content(
-                role="user",
-                parts=[types.Part(text=f"Known as (if introduced): {known_as or 'unknown'}\nMessage: {message}")]
-            )],
-            config=types.GenerateContentConfig(
-                system_instruction=EXTRACT_PROMPT,
-                max_output_tokens=200,
-                temperature=0.1
+    def _do_extraction():
+        try:
+            response = client_ai.models.generate_content(
+                model="gemini-3.1-flash-lite",
+                contents=[types.Content(
+                    role="user",
+                    parts=[types.Part(text=f"Known as (if introduced): {known_as or 'unknown'}\nMessage: {message}")]
+                )],
+                config=types.GenerateContentConfig(
+                    system_instruction=EXTRACT_PROMPT,
+                    max_output_tokens=200,
+                    temperature=0.1
+                )
             )
+            raw = response.text.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            return json.loads(raw.strip())
+        except Exception as e:
+            print(f"Fact extraction error (non-critical): {e}")
+            return []
+
+    facts = await asyncio.to_thread(_do_extraction)
+
+    for fact in facts:
+        is_introduction = (
+            "introduced" in fact.lower() or
+            "known as" in fact.lower() or
+            "calls himself" in fact.lower() or
+            "calls herself" in fact.lower()
         )
-        raw = response.text.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        facts = json.loads(raw.strip())
 
-        for fact in facts:
-            is_introduction = (
-                "introduced" in fact.lower() or
-                "known as" in fact.lower() or
-                "calls himself" in fact.lower() or
-                "calls herself" in fact.lower()
-            )
+        if is_introduction:
+            if not known_as:
+                extracted_name = fact.split("as")[-1].strip().strip('"').strip("'")
+                await asyncio.to_thread(save_user_profile, user_id, discord_name, known_as=extracted_name)
+            continue
 
-            if is_introduction:
-                if not known_as:
-                    extracted_name = fact.split("as")[-1].strip().strip('"').strip("'")
-                    save_user_profile(user_id, discord_name, known_as=extracted_name)
-                continue
-
-            if fact:
-                save_global_fact(user_id, known_as or "unknown one", fact)
-
-    except Exception as e:
-        print(f"Fact extraction error (non-critical): {e}")
+        if fact:
+            await asyncio.to_thread(save_global_fact, user_id, known_as or "unknown one", fact)
 
 
 def get_update_notice() -> str:
@@ -173,21 +194,20 @@ def get_update_notice() -> str:
 
 
 async def run_proactive_messaging():
-    """Background task that runs every 30 minutes to check if Nisama should message anyone."""
+    """Background task — checks every 15 minutes if Nisama should message anyone."""
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
-            from datetime import datetime, timezone, timedelta
             gmt8 = timezone(timedelta(hours=8))
             now_gmt8 = datetime.now(gmt8)
             hour = now_gmt8.hour
 
-            # Skip messaging between midnight and 7am GMT+8
             if 0 <= hour < 7:
-                await asyncio.sleep(1800)
+                await asyncio.sleep(900)
                 continue
 
-            users = get_proactive_enabled_users()
+            mood_data = await asyncio.to_thread(get_nisama_mood)
+            users = await asyncio.to_thread(get_proactive_enabled_users)
             for u in users:
                 try:
                     user_id = u["user_id"]
@@ -195,7 +215,6 @@ async def run_proactive_messaging():
                     last_msg = u["last_message_ts"]
                     last_proactive = u["last_proactive_ts"]
 
-                    # Build context for AI decision
                     hours_since_last = 999
                     if last_msg:
                         diff = datetime.now(timezone.utc) - last_msg.replace(tzinfo=timezone.utc)
@@ -206,39 +225,56 @@ async def run_proactive_messaging():
                         diff2 = datetime.now(timezone.utc) - last_proactive.replace(tzinfo=timezone.utc)
                         hours_since_proactive = diff2.total_seconds() / 3600
 
+                    unanswered = await asyncio.to_thread(get_unanswered_proactive_count, user_id)
+                    patterns = await asyncio.to_thread(get_user_chat_patterns, user_id)
+                    recent_history = await asyncio.to_thread(get_history, user_id, 5)
+                    last_topic = recent_history[-1]["content"] if recent_history else "nothing yet"
+
                     context = (
                         f"Person's name: {known_as}\n"
-                        f"Current time (GMT+8): {now_gmt8.strftime('%A, %H:%M')}\n"
+                        f"Current time (GMT+8): {now_gmt8.strftime('%A %d %B, %H:%M')}\n"
                         f"Hours since last conversation: {hours_since_last:.1f}\n"
                         f"Hours since Nisama last initiated: {hours_since_proactive:.1f}\n"
-                        f"Nisama's current life: {SYSTEM_PROMPT[:500]}"
+                        f"Unanswered proactive messages: {unanswered}\n"
+                        f"This person's peak chat hours (GMT+8): {patterns['peak_hours']}\n"
+                        f"Last thing discussed: {last_topic[:200]}\n"
+                        f"Nisama's current mood: {mood_data['mood']} (energy: {mood_data['energy']})\n"
+                        f"Nisama's current life context: making toast, analyzing architecture, "
+                        f"keeping in touch with Rui and Cammy, monitoring an unknown anomaly, "
+                        f"spending time with Jerson.EXE in New Hant City."
                     )
 
-                    response = client_ai.models.generate_content(
-                        model="gemini-3.1-flash-lite",
-                        contents=[types.Content(
-                            role="user",
-                            parts=[types.Part(text=context)]
-                        )],
-                        config=types.GenerateContentConfig(
-                            system_instruction=PROACTIVE_DECISION_PROMPT,
-                            max_output_tokens=300,
-                            temperature=0.9
+                    def _do_proactive():
+                        resp = client_ai.models.generate_content(
+                            model="gemini-3.1-flash-lite",
+                            contents=[types.Content(
+                                role="user",
+                                parts=[types.Part(text=context)]
+                            )],
+                            config=types.GenerateContentConfig(
+                                system_instruction=PROACTIVE_DECISION_PROMPT,
+                                max_output_tokens=400,
+                                temperature=0.95
+                            )
                         )
-                    )
+                        raw = resp.text.strip()
+                        if raw.startswith("```"):
+                            raw = raw.split("```")[1]
+                            if raw.startswith("json"):
+                                raw = raw[4:]
+                        return json.loads(raw.strip())
 
-                    raw = response.text.strip()
-                    if raw.startswith("```"):
-                        raw = raw.split("```")[1]
-                        if raw.startswith("json"):
-                            raw = raw[4:]
-                    decision = json.loads(raw.strip())
+                    decision = await asyncio.to_thread(_do_proactive)
+
+                    if "mood_after" in decision and "energy_after" in decision:
+                        await asyncio.to_thread(save_nisama_mood, decision["mood_after"], float(decision["energy_after"]))
 
                     if decision.get("should_message") and decision.get("message"):
                         discord_user = await bot.fetch_user(int(user_id))
                         await discord_user.send(decision["message"])
-                        update_last_proactive_ts(user_id)
-                        print(f"Proactive message sent to {known_as}")
+                        await asyncio.to_thread(save_message, user_id, "assistant", decision["message"])
+                        await asyncio.to_thread(update_last_proactive_ts, user_id)
+                        print(f"Proactive message sent to {known_as} ({hour}:xx GMT+8)")
 
                 except Exception as e:
                     print(f"Proactive error for {u.get('user_id')}: {e}")
@@ -246,640 +282,35 @@ async def run_proactive_messaging():
         except Exception as e:
             print(f"Proactive task error: {e}")
 
-        await asyncio.sleep(1800)  # Check every 30 minutes
-
-
-# TTT
-
-class TicTacToeView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=120)
-        self.board = [None] * 9
-        self.game_over = False
-        self._add_buttons()
-
-    def _add_buttons(self):
-        for i in range(9):
-            self.add_item(TicTacToeButton(i))
-
-    def build_embed(self, status: str = None) -> discord.Embed:
-        symbols = {None: "⬜", "X": "❌", "O": "⭕"}
-        rows = []
-        for r in range(3):
-            rows.append(" ".join(symbols[self.board[r * 3 + c]] for c in range(3)))
-        board_str = "\n".join(rows)
-
-        if self.game_over:
-            winner = self.check_winner()
-            if winner == "X":
-                title = "❌ One wins!"
-                desc = "Eek— one won?! Nisama needs to analyze this more ehehe. Good game!"
-                color = discord.Color.green()
-            elif winner == "O":
-                title = "⭕ Nisama wins!"
-                desc = "Ahehe! Nisama wins here! Good game though ehehe!"
-                color = discord.Color.red()
-            else:
-                title = "🔲 Draw!"
-                desc = "Mm... it's a draw here! One played well ehehe."
-                color = discord.Color.greyple()
-        else:
-            title = "Tic Tac Toe"
-            desc = status or "One's turn! Pick a cell ehehe."
-            color = discord.Color.blurple()
-
-        embed = discord.Embed(title=title, description=desc, color=color)
-        embed.add_field(name="Board", value=board_str, inline=False)
-        embed.set_footer(text="❌ = You  |  ⭕ = Nisama")
-        return embed
-
-    def check_winner(self) -> str | None:
-        wins = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
-        for a, b, c in wins:
-            if self.board[a] and self.board[a] == self.board[b] == self.board[c]:
-                return self.board[a]
-        if all(self.board):
-            return "draw"
-        return None
-
-    def nisama_move(self):
-        for i in range(9):
-            if self.board[i] is None:
-                self.board[i] = "O"
-                if self.check_winner() == "O":
-                    return
-                self.board[i] = None
-        for i in range(9):
-            if self.board[i] is None:
-                self.board[i] = "X"
-                if self.check_winner() == "X":
-                    self.board[i] = "O"
-                    return
-                self.board[i] = None
-        if self.board[4] is None:
-            self.board[4] = "O"
-            return
-        for i in [0, 2, 6, 8]:
-            if self.board[i] is None:
-                self.board[i] = "O"
-                return
-        for i in range(9):
-            if self.board[i] is None:
-                self.board[i] = "O"
-                return
-
-
-class TicTacToeButton(discord.ui.Button):
-    def __init__(self, index: int):
-        super().__init__(style=discord.ButtonStyle.secondary, label="·", row=index // 3)
-        self.index = index
-
-    async def callback(self, interaction: discord.Interaction):
-        view: TicTacToeView = self.view
-        if view.game_over or view.board[self.index] is not None:
-            await interaction.response.defer()
-            return
-
-        view.board[self.index] = "X"
-        self.style = discord.ButtonStyle.danger
-        self.label = "❌"
-        self.disabled = True
-
-        winner = view.check_winner()
-        if winner:
-            view.game_over = True
-            for item in view.children:
-                item.disabled = True
-            embed = view.build_embed()
-            await interaction.response.edit_message(embed=embed, view=view)
-            return
-
-        view.nisama_move()
-        for item in view.children:
-            if isinstance(item, TicTacToeButton):
-                if view.board[item.index] == "O":
-                    item.style = discord.ButtonStyle.primary
-                    item.label = "⭕"
-                    item.disabled = True
-
-        winner = view.check_winner()
-        if winner:
-            view.game_over = True
-            for item in view.children:
-                item.disabled = True
-
-        embed = view.build_embed()
-        await interaction.response.edit_message(embed=embed, view=view)
-
-
-# UTT
-
-BOARD_NAMES = [
-    "Top-Left", "Top-Center", "Top-Right",
-    "Middle-Left", "Center", "Middle-Right",
-    "Bottom-Left", "Bottom-Center", "Bottom-Right"
-]
-
-class UltimateTTTGame:
-    def __init__(self):
-        self.boards = [[None] * 9 for _ in range(9)]
-        self.board_winners = [None] * 9
-        self.active_board = None
-        self.game_over = False
-        self.global_winner = None
-        self.move_log = []
-        self.move_number = 0
-
-    def check_board_winner(self, cells: list) -> str | None:
-        wins = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
-        for a, b, c in wins:
-            if cells[a] and cells[a] == cells[b] == cells[c]:
-                return cells[a]
-        if all(cells):
-            return "draw"
-        return None
-
-    def check_global_winner(self) -> str | None:
-        return self.check_board_winner(
-            [w if w != "draw" else None for w in self.board_winners]
-        )
-
-    def get_playable_boards(self) -> list:
-        if self.active_board is not None:
-            if self.board_winners[self.active_board] is None and any(c is None for c in self.boards[self.active_board]):
-                return [self.active_board]
-        return [
-            i for i in range(9)
-            if self.board_winners[i] is None and any(c is None for c in self.boards[i])
-        ]
-
-    def nisama_move(self):
-        playable = self.get_playable_boards()
-        for bi in playable:
-            for ci in range(9):
-                if self.boards[bi][ci] is None:
-                    self.boards[bi][ci] = "O"
-                    if self.check_board_winner(self.boards[bi]) == "O":
-                        self.board_winners[bi] = "O"
-                        return bi, ci
-                    self.boards[bi][ci] = None
-        for bi in playable:
-            for ci in range(9):
-                if self.boards[bi][ci] is None:
-                    self.boards[bi][ci] = "X"
-                    if self.check_board_winner(self.boards[bi]) == "X":
-                        self.boards[bi][ci] = "O"
-                        w = self.check_board_winner(self.boards[bi])
-                        if w:
-                            self.board_winners[bi] = w
-                        return bi, ci
-                    self.boards[bi][ci] = None
-        for bi in playable:
-            if self.boards[bi][4] is None:
-                self.boards[bi][4] = "O"
-                w = self.check_board_winner(self.boards[bi])
-                if w:
-                    self.board_winners[bi] = w
-                return bi, 4
-        for bi in playable:
-            for ci in range(9):
-                if self.boards[bi][ci] is None:
-                    self.boards[bi][ci] = "O"
-                    w = self.check_board_winner(self.boards[bi])
-                    if w:
-                        self.board_winners[bi] = w
-                    return bi, ci
-        return None, None
-
-    def render_global_board(self) -> str:
-        symbols = {None: "⬜", "X": "❌", "O": "⭕", "draw": "🔲"}
-        rows = []
-        for r in range(3):
-            row = []
-            for c in range(3):
-                bi = r * 3 + c
-                if self.board_winners[bi]:
-                    row.append(symbols[self.board_winners[bi]])
-                elif bi == self.active_board:
-                    row.append("🟦")
-                else:
-                    row.append("⬜")
-            rows.append(" ".join(row))
-        return "\n".join(rows)
-
-    def render_local_board(self, board_index: int) -> str:
-        cells = self.boards[board_index]
-        rows = []
-        for r in range(3):
-            row = []
-            for c in range(3):
-                ci = r * 3 + c
-                v = cells[ci]
-                row.append("❌" if v == "X" else "⭕" if v == "O" else "·")
-            rows.append(" ".join(row))
-        return "\n".join(rows)
-
-    def build_embed(self, status: str = None, log_page: int = 0) -> discord.Embed:
-        playable = self.get_playable_boards()
-        active = self.active_board if self.active_board is not None else (playable[0] if playable else 0)
-
-        if self.game_over:
-            if self.global_winner == "X":
-                title = "❌ One wins the Super Board!"
-                desc = "Eek— one won the whole thing?! Nisama needs to analyze this more ehehe. Amazing game!"
-                color = discord.Color.green()
-            elif self.global_winner == "O":
-                title = "⭕ Nisama wins the Super Board!"
-                desc = "Ahehe! Nisama wins here! Really good game though ehehe!"
-                color = discord.Color.red()
-            else:
-                title = "🔲 Full Draw!"
-                desc = "Mm... it's a full draw here! One played really well ehehe."
-                color = discord.Color.greyple()
-        else:
-            title = f"Ultimate Tic Tac Toe — {BOARD_NAMES[active]}"
-            desc = status or "One's turn! Pick a cell in the active board ehehe."
-            color = discord.Color.blurple()
-
-        embed = discord.Embed(title=title, description=desc, color=color)
-        embed.add_field(
-            name="🌐 Global Board",
-            value=self.render_global_board(),
-            inline=True
-        )
-        embed.add_field(
-            name=f"🎯 Active — {BOARD_NAMES[active] if not self.game_over else 'Done'}",
-            value=self.render_local_board(active) if not self.game_over else "Game over!",
-            inline=True
-        )
-
-        # Paginated move log — 8 moves per page
-        if self.move_log:
-            page_size = 8
-            total_pages = max(1, (len(self.move_log) + page_size - 1) // page_size)
-            log_page = max(0, min(log_page, total_pages - 1))
-            start = log_page * page_size
-            end = start + page_size
-            log_text = "\n".join(self.move_log[start:end])
-            embed.add_field(
-                name=f"📋 Move Log (Page {log_page + 1}/{total_pages})",
-                value=log_text,
-                inline=False
-            )
-
-        embed.set_footer(text="❌ = You  |  ⭕ = Nisama  |  🟦 = Active Board  |  🔲 = Draw")
-        return embed
-
-    def build_message(self, status: str = None, log_page: int = 0) -> tuple:
-        playable = self.get_playable_boards()
-        active = self.active_board if self.active_board is not None and not self.game_over else (playable[0] if playable else 0)
-        embed = self.build_embed(status=status, log_page=log_page)
-        view = UltimateTTTView(self, active if not self.game_over else None, log_page=log_page)
-        return embed, view
-
-
-class UltimateTTTView(discord.ui.View):
-    def __init__(self, game: UltimateTTTGame, board_index: int | None, log_page: int = 0):
-        super().__init__(timeout=300)
-        self.game = game
-        self.board_index = board_index
-        self.log_page = log_page
-
-        # Game buttons — rows 0,1,2
-        if board_index is not None:
-            cells = game.boards[board_index]
-            symbols = {"X": "❌", "O": "⭕"}
-            for ci in range(9):
-                taken = cells[ci] is not None
-                btn = discord.ui.Button(
-                    style=discord.ButtonStyle.danger if cells[ci] == "X"
-                          else discord.ButtonStyle.primary if cells[ci] == "O"
-                          else discord.ButtonStyle.secondary,
-                    label=symbols.get(cells[ci], "·"),
-                    row=ci // 3,
-                    disabled=taken or game.game_over
-                )
-                btn.callback = self._make_callback(ci)
-                self.add_item(btn)
-
-        # Pagination buttons — row 3
-        total_pages = max(1, (len(game.move_log) + 7) // 8)
-        prev_btn = discord.ui.Button(
-            label="◀",
-            style=discord.ButtonStyle.secondary,
-            disabled=log_page <= 0,
-            row=3
-        )
-        next_btn = discord.ui.Button(
-            label="▶",
-            style=discord.ButtonStyle.secondary,
-            disabled=log_page >= total_pages - 1,
-            row=3
-        )
-        prev_btn.callback = self._make_page_callback(log_page - 1)
-        next_btn.callback = self._make_page_callback(log_page + 1)
-        self.add_item(prev_btn)
-        self.add_item(next_btn)
-
-    def _make_page_callback(self, new_page: int):
-        async def callback(interaction: discord.Interaction):
-            embed, view = self.game.build_message(log_page=new_page)
-            await interaction.response.edit_message(embed=embed, view=view)
-        return callback
-
-    def _make_callback(self, cell_index: int):
-        async def callback(interaction: discord.Interaction):
-            game = self.game
-            bi = self.board_index
-
-            if game.game_over or game.boards[bi][cell_index] is not None:
-                await interaction.response.defer()
-                return
-
-            # Player move
-            game.move_number += 1
-            game.boards[bi][cell_index] = "X"
-            w = game.check_board_winner(game.boards[bi])
-            if w:
-                game.board_winners[bi] = w
-                game.move_log.append(f"#{game.move_number} ❌ won {BOARD_NAMES[bi]}!")
-            else:
-                game.move_log.append(f"#{game.move_number} ❌ → {BOARD_NAMES[bi]}, cell {cell_index + 1}")
-
-            next_board = cell_index
-            if game.board_winners[next_board] is not None or all(c is not None for c in game.boards[next_board]):
-                game.active_board = None
-            else:
-                game.active_board = next_board
-
-            gw = game.check_global_winner()
-            if gw:
-                game.game_over = True
-                game.global_winner = gw
-                embed, view = game.build_message()
-                await interaction.response.edit_message(embed=embed, view=view)
-                return
-
-            # Nisama move
-            nbi, nci = game.nisama_move()
-            if nbi is not None:
-                game.move_number += 1
-                if game.board_winners[nbi] is not None:
-                    game.move_log.append(f"#{game.move_number} ⭕ won {BOARD_NAMES[nbi]}!")
-                else:
-                    game.move_log.append(f"#{game.move_number} ⭕ → {BOARD_NAMES[nbi]}, cell {nci + 1}")
-
-                next_board2 = nci
-                if game.board_winners[next_board2] is not None or all(c is not None for c in game.boards[next_board2]):
-                    game.active_board = None
-                else:
-                    game.active_board = next_board2
-
-                gw = game.check_global_winner()
-                if gw:
-                    game.game_over = True
-                    game.global_winner = gw
-                    embed, view = game.build_message()
-                    await interaction.response.edit_message(embed=embed, view=view)
-                    return
-
-            playable = game.get_playable_boards()
-            if not playable:
-                game.game_over = True
-                game.global_winner = "draw"
-                embed, view = game.build_message()
-                await interaction.response.edit_message(embed=embed, view=view)
-                return
-
-            next_active = game.active_board if game.active_board is not None else playable[0]
-            status = f"Nisama moved! Now playing in **{BOARD_NAMES[next_active]}** ehehe."
-
-            # Stay on last page to show latest moves
-            last_page = max(0, (len(game.move_log) - 1) // 8)
-            embed, view = game.build_message(status=status, log_page=last_page)
-            await interaction.response.edit_message(embed=embed, view=view)
-
-        return callback
-
-
-# Slashes
-
-@bot.tree.command(name="changelog", description="See what's new with Nisama")
-async def slash_changelog(interaction: discord.Interaction):
-    log_slash_command(str(interaction.user.id), "changelog")
-    await interaction.response.send_message(CHANGELOG, ephemeral=True)
-
-
-@bot.tree.command(name="introduce", description="Get a short introduction from Nisama")
-async def slash_introduce(interaction: discord.Interaction):
-    log_slash_command(str(interaction.user.id), "introduce")
-    intro = (
-        "Greetings there! This is Nisama here — Nova-Project 8, Alpha-FeNI2S. "
-        "Nisama is an 8th generation android, made with a lot of care by someone Nisama holds dear. "
-        "Nisama woke up in Hant City a while back and has been finding Nisama's way ever since here. "
-        "Nisama is really glad one is here! Feel free to just DM Nisama anytime ehehe."
-    )
-    await interaction.response.send_message(intro, ephemeral=True)
-
-
-@bot.tree.command(name="pat", description="Pat Nisama on the bun")
-async def slash_pat(interaction: discord.Interaction):
-    log_slash_command(str(interaction.user.id), "pat")
-    responses = [
-        "Ah—! Ehehe... that was really nice here. Thanksie.",
-        "Nisama was not expecting that! But... ehehe. Nisama liked it here.",
-        "Mm... Nisama feels really warm right now ehehe. Thanksie for the pat here.",
-        "Nisama's bun got patted! Ehehe... one is really kind here.",
-        "Ah— ehehe! Nisama is a little flustered now here. But really thanksie.",
-    ]
-    await interaction.response.send_message(random.choice(responses))
-
-
-@bot.tree.command(name="send", description="Have Nisama deliver a message to someone")
-@app_commands.describe(
-    user_id="The Discord user ID or @mention to send the message to",
-    message="The message to deliver"
-)
-async def slash_send(interaction: discord.Interaction, user_id: str, message: str):
-    await interaction.response.defer(ephemeral=True)
-
-    sender_profile = get_user_profile(str(interaction.user.id))
-    sender_name = sender_profile["known_as"] if sender_profile and sender_profile["known_as"] else "someone"
-
-    cleaned_id = user_id.strip().lstrip("<@!").rstrip(">")
-
-    delivery = (
-        f"Greetings there! Nisama has a message here from {sender_name}!\n\n"
-        f"{message}\n\n"
-        f"Nisama hopes one is doing well here hihi."
-    )
-
-    try:
-        target_user = await bot.fetch_user(int(cleaned_id))
-        await target_user.send(delivery)
-        asyncio.create_task(asyncio.to_thread(log_slash_command, str(interaction.user.id), "send"))
-        asyncio.create_task(asyncio.to_thread(log_send_command, str(interaction.user.id), cleaned_id, message))
-        await interaction.followup.send(
-            f"Nisama delivered the message to {target_user.display_name} here ehehe!",
-            ephemeral=True
-        )
-    except discord.NotFound:
-        await interaction.followup.send(
-            "Mm... Nisama could not find that user here. Please double check the ID or mention ehehe.",
-            ephemeral=True
-        )
-    except discord.Forbidden:
-        await interaction.followup.send(
-            "Mm... Nisama could not reach that user here. One might have DMs closed.",
-            ephemeral=True
-        )
-    except ValueError:
-        await interaction.followup.send(
-            "Eh— that does not look like a valid user ID or mention here. Please try again here.",
-            ephemeral=True
-        )
-
-
-@bot.tree.command(name="lore", description="Learn about the world of Nisama")
-async def slash_lore(interaction: discord.Interaction):
-    coming_soon = (
-        "**Nisama Lore**\n\n"
-        "Mm... this section is still being put together here!\n\n"
-        "Nisama Lore is going to be a full reference for the world, characters, and story "
-        "that Nisama is part of — kind of like a little fandom wiki right here in Discord ehehe.\n\n"
-        "Check back on a future update here! Nisama is sure it will be worth the wait ehehe."
-    )
-    await interaction.response.send_message(coming_soon, ephemeral=True)
-    asyncio.create_task(asyncio.to_thread(log_slash_command, str(interaction.user.id), "lore"))
-
-
-@bot.tree.command(name="ttt", description="Play Tic Tac Toe with Nisama")
-async def slash_ttt(interaction: discord.Interaction):
-    await interaction.response.defer()
-    try:
-        view = TicTacToeView()
-        embed = view.build_embed()
-        await interaction.followup.send(embed=embed, view=view)
-    except Exception as e:
-        print(f"TTT error: {e}")
-        await interaction.followup.send("Eh— something went wrong here. Please try again here.")
-    asyncio.create_task(asyncio.to_thread(log_slash_command, str(interaction.user.id), "ttt"))
-
-
-@bot.tree.command(name="utt", description="Play Ultimate Tic Tac Toe with Nisama")
-async def slash_utt(interaction: discord.Interaction):
-    await interaction.response.defer()
-    try:
-        game = UltimateTTTGame()
-        embed, view = game.build_message()
-        await interaction.followup.send(embed=embed, view=view)
-    except Exception as e:
-        print(f"UTT error: {e}")
-        await interaction.followup.send("Eh— something went wrong setting up the game here. Please try again here.")
-    asyncio.create_task(asyncio.to_thread(log_slash_command, str(interaction.user.id), "utt"))
-
-
-@bot.tree.command(name="stats", description="See Nisama's global interaction stats")
-async def slash_stats(interaction: discord.Interaction):
-    await interaction.response.defer()
-    try:
-        stats = get_slash_stats()
-        embed = discord.Embed(
-            title="📊 Nisama Stats",
-            description="Here is what Nisama has been up to globally!",
-            color=discord.Color.blurple()
-        )
-
-        if stats["commands"]:
-            cmd_text = "\n".join(f"`/{cmd}` — {count} times" for cmd, count in stats["commands"].items())
-            embed.add_field(name="🎮 Slash Commands Used", value=cmd_text, inline=False)
-
-        if stats["top_users"]:
-            user_text = ""
-            medals = ["🥇", "🥈", "🥉"]
-            for i, u in enumerate(stats["top_users"]):
-                medal = medals[i] if i < len(medals) else "•"
-                user_text += f"{medal} **{u['name']}** — {u['count']} messages\n"
-            embed.add_field(name="💬 Most Active Chatters", value=user_text, inline=False)
-
-        await interaction.followup.send(embed=embed)
-    except Exception as e:
-        print(f"Stats error: {e}")
-        await interaction.followup.send("Eh— something went wrong loading stats here. Please try again here.")
-    asyncio.create_task(asyncio.to_thread(log_slash_command, str(interaction.user.id), "stats"))
-
-
-# @bot.tree.command(name="sentient", description="Toggle Nisama's proactive messaging on or off")
-# async def slash_sentient(interaction: discord.Interaction):
-#     await interaction.response.defer(ephemeral=True)
-#     user_id = str(interaction.user.id)
-#     current = get_proactive_setting(user_id)
-#     new_state = not current
-#     set_proactive_enabled(user_id, new_state)
-# 
-#     if new_state:
-#         msg = "Nisama's proactive messaging is now **on** here! Nisama may reach out when the moment feels right ehehe."
-#     else:
-#         msg = "Nisama's proactive messaging is now **off** here. Nisama will wait for one to reach out first ehehe."
-# 
-#     await interaction.followup.send(msg, ephemeral=True)
-#     asyncio.create_task(asyncio.to_thread(log_slash_command, user_id, "sentient"))
-
-
-@bot.tree.command(name="voice", description="Have Nisama join your voice channel")
-async def slash_voice(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    asyncio.create_task(asyncio.to_thread(log_slash_command, str(interaction.user.id), "voice"))
-
-    if not interaction.guild:
-        await interaction.followup.send(
-            "Mm... this command needs to be used in a server here, not in DMs ehehe.",
-            ephemeral=True
-        )
-        return
-
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.followup.send(
-            "Eek— one doesn't seem to be in a voice channel here. Please join one first ehehe!",
-            ephemeral=True
-        )
-        return
-
-    channel = interaction.user.voice.channel
-
-    # Leave any existing voice connection in this guild
-    if interaction.guild.voice_client:
-        await interaction.guild.voice_client.disconnect()
-
-    await channel.connect()
-    await interaction.followup.send(
-        f"Nisama joined **{channel.name}** here! Nisama will leave if one is no longer there ehehe.",
-        ephemeral=True
-    )
-
-    # Start idle watcher
-    bot.loop.create_task(voice_idle_watcher(interaction.guild, channel))
-
-
-async def voice_idle_watcher(guild: discord.Guild, channel):
-    """Leave voice channel if empty for 3 minutes."""
-    await asyncio.sleep(30)
-    while True:
-        vc = guild.voice_client
-        if not vc or not vc.is_connected():
-            break
-        # Count non-bot members in channel
-        members = [m for m in channel.members if not m.bot]
-        if not members:
-            await vc.disconnect()
-            print(f"Left voice channel {channel.name} — no users present.")
-            break
-        await asyncio.sleep(30)
+        await asyncio.sleep(900)
 
 
 # Events
 
-VALID_COMMANDS = ["changelog", "introduce", "pat", "send", "lore", "ttt", "utt", "stats", "voice"]
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    """Detect when someone starts streaming in a channel Nisama is in."""
+    if member.bot:
+        return
+
+    guild = member.guild
+    vc = guild.voice_client
+    if not vc or not vc.channel:
+        return
+
+    if (after.channel and after.channel == vc.channel and
+        after.self_stream and not before.self_stream):
+        try:
+            profile = get_user_profile(str(member.id))
+            name = profile["known_as"] if profile and profile["known_as"] else "one"
+            await member.send(
+                f"Ah— Nisama noticed {name} started streaming here! "
+                f"Nisama is watching from the voice channel ehehe."
+            )
+            print(f"Stream detected: {member.display_name} in {after.channel.name}")
+        except Exception as e:
+            print(f"Stream notification error: {e}")
+
 
 @bot.event
 async def on_ready():
@@ -892,11 +323,9 @@ async def on_ready():
     except Exception as e:
         print(f"Slash command sync error: {e}")
 
-    # Clean stale command logs
     asyncio.create_task(asyncio.to_thread(clean_slash_stats, VALID_COMMANDS))
 
-    # Start proactive messaging background task
-    bot.loop.create_task(run_proactive_messaging())
+    asyncio.ensure_future(run_proactive_messaging())
 
 
 @bot.event
@@ -919,14 +348,14 @@ async def on_message(message):
     if not user_text:
         return
 
-    save_user_profile(user_id, discord_display_name)
-    profile = get_user_profile(user_id)
+    await asyncio.to_thread(save_user_profile, user_id, discord_display_name)
+    profile = await asyncio.to_thread(get_user_profile, user_id)
     asyncio.create_task(extract_and_save_facts(user_id, discord_display_name, user_text, profile))
 
-    history = get_history(user_id)
-    save_message(user_id, "user", user_text)
+    history = await asyncio.to_thread(get_history, user_id, 50)
+    await asyncio.to_thread(save_message, user_id, "user", user_text)
 
-    global_context = build_global_context()
+    global_context = await asyncio.to_thread(build_global_context)
 
     full_system = SYSTEM_PROMPT
     if profile and profile["known_as"]:
@@ -938,9 +367,9 @@ async def on_message(message):
 
     # This one to check if this is the first message after an update
     update_notice = ""
-    if not has_seen_update(user_id, CHANGELOG_VERSION):
+    if not await asyncio.to_thread(has_seen_update, user_id, CHANGELOG_VERSION):
         update_notice = get_update_notice()
-        mark_update_seen(user_id, CHANGELOG_VERSION)
+        await asyncio.to_thread(mark_update_seen, user_id, CHANGELOG_VERSION)
 
     error_occurred = False
     async with message.channel.typing():
@@ -953,15 +382,18 @@ async def on_message(message):
                 )
             )
 
-            response = client_ai.models.generate_content(
-                model="gemini-3.1-flash-lite",
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=full_system,
-                    max_output_tokens=1024,
-                    temperature=0.85
+            def _do_reply():
+                return client_ai.models.generate_content(
+                    model="gemini-3.1-flash-lite",
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=full_system,
+                        max_output_tokens=1024,
+                        temperature=0.85
+                    )
                 )
-            )
+
+            response = await asyncio.to_thread(_do_reply)
             reply = response.text
 
         except Exception as e:
@@ -970,24 +402,22 @@ async def on_message(message):
             error_occurred = True
 
     if not error_occurred:
-        save_message(user_id, "assistant", reply)
+        await asyncio.to_thread(save_message, user_id, "assistant", reply)
 
     if len(reply) > 2000:
         reply = reply[:1997] + "..."
 
-    # Send update notice first if applicable
     if update_notice and not error_occurred:
         try:
             notice_msg = await message.channel.send(update_notice)
+            await message.channel.send(reply)
             await asyncio.sleep(30)
             await notice_msg.delete()
         except Exception:
-            pass
+            await message.channel.send(reply)
+    else:
+        await message.channel.send(reply)
 
-    await message.channel.send(reply)
-
-    # Process bot commands (needed for commands.Bot)
     await bot.process_commands(message)
-
 
 bot.run(os.getenv("DISCORD_TOKEN"))
